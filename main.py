@@ -20,7 +20,7 @@ Why LAB?
     difference — no hand-tuned hue-tolerance constants.
 
 Usage:
-    pip install opencv-python numpy
+    pip install opencv-python numpy picamera2
     python main.py --video  gameplay.mp4
     python main.py --webcam
 """
@@ -53,6 +53,10 @@ RANSAC_THRESHOLD = 5.0
 
 # Reject homographies whose quad area deviates too far from the template area.
 AREA_RATIO_RANGE = (0.1, 10.0)
+
+# PiCamera capture resolution.
+PICAM_WIDTH  = 640
+PICAM_HEIGHT = 480
 
 # Draw colours per label (BGR).
 # Shiny labels get a gold tint; regular labels cycle through a palette.
@@ -286,9 +290,10 @@ def detect(frame, templates, orb, matcher, profiles) -> np.ndarray:
     return output
 
 
-# ── Video / webcam runner ─────────────────────────────────────────────────────
+# ── Video / webcam runners ────────────────────────────────────────────────────
 
 def run_on_video(source, templates, orb, matcher, profiles):
+    """Run detection on a video file or HTTP stream."""
     if isinstance(source, str) and source.startswith("http"):
         cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -336,17 +341,113 @@ def run_on_video(source, templates, orb, matcher, profiles):
     t_detection.start()
 
     print("[Video] Running — Q to quit")
+    cv2.namedWindow("Pokemon Matcher")
 
     while True:
         with result_lock:
             display = latest_result
+
+        # Fall back to the raw frame while detection hasn't produced a result yet
+        if display is None:
+            with frame_lock:
+                display = latest_frame
+
         if display is not None:
             cv2.imshow("Pokemon Matcher", display)
+
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
     stop_event.set()
     cap.release()
+    cv2.destroyAllWindows()
+
+
+def run_on_picam(templates, orb, matcher, profiles):
+    """
+    Run detection using Picamera2 (libcamera) instead of cv2.VideoCapture.
+
+    Picamera2 is the correct way to access CSI cameras on Raspberry Pi OS
+    Bullseye/Bookworm — cv2.VideoCapture does not support libcamera.
+
+    Format RGB888 gives a 3-channel array that OpenCV treats as BGR directly,
+    avoiding the 4-channel alpha-strip needed with XRGB8888.
+    """
+    from picamera2 import Picamera2
+    from libcamera import controls
+
+    picam2 = Picamera2()
+    picam2.configure(picam2.create_video_configuration(
+        main={"format": "RGB888", "size": (PICAM_WIDTH, PICAM_HEIGHT)}
+    ))
+    picam2.start()
+    picam2.set_controls({
+        "AfMode": controls.AfModeEnum.Continuous,
+        "AfSpeed": controls.AfSpeedEnum.Fast,
+    })
+    print("[INFO] Continuous autofocus enabled")
+    print(f"[PiCam] Started — {PICAM_WIDTH}×{PICAM_HEIGHT} RGB888")
+
+    latest_frame  = None
+    latest_result = None
+    frame_lock    = threading.Lock()
+    result_lock   = threading.Lock()
+    stop_event    = threading.Event()
+
+    def capture_loop():
+        nonlocal latest_frame
+        while not stop_event.is_set():
+            frame = picam2.capture_array()
+            if frame is None:
+                time.sleep(0.001)
+                continue
+            with frame_lock:
+                latest_frame = frame
+
+    def detection_loop():
+        nonlocal latest_result
+        last_processed = None
+        while not stop_event.is_set():
+            with frame_lock:
+                frame = latest_frame
+            if frame is None or frame is last_processed:
+                time.sleep(0.001)
+                continue
+            last_processed = frame
+            result = detect(frame, templates, orb, matcher, profiles)
+            with result_lock:
+                latest_result = result
+
+    t_capture   = threading.Thread(target=capture_loop,   daemon=True)
+    t_detection = threading.Thread(target=detection_loop, daemon=True)
+    t_capture.start()
+    t_detection.start()
+
+    print("[PiCam] Running — Q to quit")
+
+    # startWindowThread() + namedWindow on the main thread — required on
+    # Raspberry Pi OS (Wayland/X11) for imshow to render correctly
+    cv2.startWindowThread()
+    cv2.namedWindow("Pokemon Matcher")
+
+    while True:
+        with result_lock:
+            display = latest_result
+
+        # Fall back to the raw frame while detection hasn't produced a result yet
+        if display is None:
+            with frame_lock:
+                display = latest_frame
+
+        if display is not None:
+            cv2.imshow("Pokemon Matcher", display)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    stop_event.set()
+    picam2.stop()
+    picam2.close()
     cv2.destroyAllWindows()
 
 
@@ -393,7 +494,8 @@ def main():
     parser = argparse.ArgumentParser(description="Pokemon sprite matcher v3 (ORB + LAB)")
     group  = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--video",  metavar="PATH")
-    group.add_argument("--webcam", action="store_true")
+    group.add_argument("--webcam", action="store_true",
+                       help="Use Picamera2 (libcamera) — for Raspberry Pi CSI cameras")
     parser.add_argument(
         "--target",
         metavar="DEX_NUM",
@@ -427,7 +529,7 @@ def main():
     if args.video:
         run_on_video(args.video, templates, orb, matcher, profiles)
     elif args.webcam:
-        run_on_video(0, templates, orb, matcher, profiles)
+        run_on_picam(templates, orb, matcher, profiles)
 
 
 if __name__ == "__main__":

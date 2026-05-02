@@ -1,7 +1,4 @@
-# --- color_score.py  (LAB-based rewrite) ---
-#
-# Replaces the bespoke HSV / hue-histogram approach with a perceptually
-# uniform CIE-LAB color profile.
+# --- color_score.py  (LAB-based) ---
 #
 # Why LAB?
 #   • L* is lightness — we can ignore it and compare only a*b* (chroma).
@@ -33,12 +30,10 @@ MIN_CHROMA_PIXELS = 10
 @dataclass
 class ColorProfile:
     label: str
-    # Weighted list of (a*, b*, weight) cluster centres from the template.
     clusters: list = field(default_factory=list)   # [(a, b, weight), …]
 
 
 # ── profile builder ───────────────────────────────────────────────────────────
-
 def _chroma_pixels_lab(img_bgr, alpha_mask=None):
     """Return (a*, b*) arrays for every sufficiently chromatic pixel."""
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2Lab).astype(np.float32)
